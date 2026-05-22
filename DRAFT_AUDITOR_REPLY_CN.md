@@ -1,0 +1,342 @@
+# 审计师回复（简体中文版） — IFRS 9 ECL 方法论审阅问题
+
+> **日期:** 2026-05-22
+> **语言说明:** 本文档为简体中文版本，如有不一致以英文版本为准。
+
+---
+
+## 目录
+
+1. [Threshold > 10 中 "Count" 的定义](#1-ph-bnpl-ttc-pd-中-threshold--10-的-count-定义)
+2. [Stage 3 PD = 100% — 文档一致性](#2-stage-3-pd--100--文档一致性)
+3. [Lifetime PD 方法论 — M3+ 处理](#3-lifetime-pd-方法论--矩阵乘法中-m3-的处理)
+4. [ECL 重算差异 — 18 个月 Cap](#4-ecl-重算差异--18-个月-marginal-pd-capping-的影响)
+5. [情景叙述](#5-情景叙述)
+6. [概率权重定量计算方法](#6-情景概率权重-pw-定量计算方法)
+7. [参考文献](#参考文献)
+
+---
+
+## 1. PH BNPL TTC PD 中 Threshold > 10 的 "Count" 定义
+
+筛选月度迁移数据时，阈值 **10** 指的是某月份中观测到的**迁移记录行数**，而非贷款总笔数。
+
+每行代表一个唯一的迁移路径（从一个逾期 bucket 到另一个），并携带 `order_count` 字段表示沿该路径迁移的贷款笔数。
+
+具体筛选逻辑：
+
+- 对每个日历月 *m*，从迁移数据集中提取 `sys_date = m` 的所有记录
+- 如果该月迁移记录**行数 < 10**，则**整月排除**，不参与 TTC 转移矩阵的计算
+- 此门槛确保转移概率估计不会被样本多样性不足的月份（如组合早期月份或数据缺口期）扭曲
+
+通过阈值的月份，其行归一化转移矩阵纳入**等权算术平均**，形成 **P_TTC**（详见 ECL 方法论文档 S3.1.2）。
+
+---
+
+## 2. Stage 3 PD = 100% — 文档一致性
+
+Stage 3 (M3+, 信用减值) 暴露赋值 **PD = 100%** 在框架所有层面保持**一致**：
+
+- **ECL 方法论（S2.1）：** Stage 3 定义为 "非正常/信用减值"，"PD 设为 100%"
+- **ECL 方法论（S7.2）：** 明确公式 **ECL = EAD x LGD / (1 + EIR)**，**PD = 1**
+- **计算引擎：** 代码直接赋值 `PD = 1.0`，完全跳过 MPD surface
+
+此处理符合 IFRS 9 信用减值定义及公司违约定义（DPD > 90 天），并与 EBA 关于信用风险管理实务与预期信用损失会计的指南 ([EBA, 2017](https://www.eba.europa.eu/documents/10180/1842525/d769d006-d992-4202-8838-711a034e80a2/Final%20Guidelines%20on%20Accounting%20for%20Expected%20Credit%20Losses%20(EBA-GL-2017-06).pdf)) 保持一致。
+
+---
+
+## 3. Lifetime PD 方法论 — 矩阵乘法中 M3+ 的处理
+
+### 3.1 确认
+
+Lifetime PD 方法基于**马尔可夫链矩阵乘法**，其中 **M3+ 建模为非吸收状态**。
+
+以 5x5 TTC 转移矩阵为例，每行显示某 bucket 中的账户在一个月内的去向分布：
+
+```
+             去向:  M0     M1     M2     M3     M3+
+从 M0  :         [ 0.92   0.06   0.01   0.005  0.005 ]
+从 M1  :         [ 0.35   0.40   0.15   0.05   0.05  ]
+从 M2  :         [ 0.10   0.15   0.30   0.25   0.20  ]
+从 M3  :         [ 0.05   0.05   0.10   0.30   0.50  ]
+从 M3+ :         [ 0.03   0.02   0.05   0.10   0.80  ]  <- 非吸收态
+                                                           (行和 = 1，但
+                                                            M3+->M3+ < 1.00)
+```
+
+如果采用**吸收态**，M3+ 行将变为 `[0, 0, 0, 0, 1.00]` — 一旦进入 M3+，永远无法离开。本模型矩阵保留了 M3+ 行的**实际观测转移概率**，允许部分概率质量回流到正常状态（治愈、回款、恢复还款）。
+
+**计算违约概率曲面 — 分步说明：**
+
+```
+算法：违约概率曲面
+
+输入：P_TTC = 5x5 转移矩阵（如上，非吸收态）
+输出：DP[bucket][t]，t = 1, 2, ..., 18
+
+1. 对每个时间步 t = 1 到 18：
+     P_t  = P_TTC ^ t          (矩阵幂：P x P x ... x P，共 t 次)
+
+2. 对每个起始 bucket b:
+     DP[b][t] = P_t[b][M3+]    (状态占据概率：从 bucket b 出发，
+                                 在时间 t 处于 M3+ 状态的概率)
+
+   术语说明：
+   - 在吸收态模型中，DP(t) 等于累积违约概率（在时间 t 之前曾经
+     进入 M3+ 的概率），因为 M3+ 状态一旦进入无法离开
+   - 在非吸收态模型中，DP(t) 是时间 t 时 M3+ 的状态概率——
+     账户在此前可能已进出过 M3+
+   - 对于短期限组合（实际最大期限 13 个月），两种理解的差异不具
+     有重要性
+
+3. 对每个起始 bucket b:
+     增量违约概率[b][t] = max(0, DP[b][t] - DP[b][t-1])
+
+   此增量违约概率作为多期 ECL 公式中第 t 期的违约权重。
+   下限归零的原因：非吸收结构允许 DP 下降（净治愈数超过
+   新进入数），负违约概率在经济学上没有意义。
+```
+
+### 3.2 对 ECL 的影响
+
+**非吸收矩阵不影响 M3+ 暴露的 ECL。** ECL 计算遵循两条独立路径：
+
+```
+ECL 计算 — 两条独立的代码路径：
+
+如果 bucket == M3+：
+    ECL = EAD_0 x 1.0 x LGD / (1 + EIR)       PD 硬编码为 100%
+    (不使用违约概率曲面)                        矩阵输出被忽略
+
+否则（bucket 属于 {M0, M1, M2, M3}）：
+    ECL = 对 t=1..T 求和：
+        EAD(t-1) x 增量违约概率(t) x LGD       使用矩阵幂计算的
+        / (1 + EIR)^t                           增量违约概率
+```
+
+两条路径**完全独立**。无论 M3+ 在转移矩阵中是吸收态还是非吸收态，M3+ 账户在 ECL 公式中始终使用 `PD = 1.0`。矩阵结构选择对 Stage 3 ECL 影响为零 — 仅影响 Stage 1/2。
+
+### 3.3 对 Stage 1/2 违约概率的影响
+
+非吸收态影响 **Stage 1/2 起始 bucket**（M0-M3）的违约概率路径。当这些 bucket 的账户通过矩阵幂到达 M3+ 时，非吸收结构允许部分概率质量回流到正常状态，导致 **违约概率增长率略低于**吸收态设定。
+
+**示意对比（M0 起始 bucket）：**
+
+```
+时间（月）   DP_吸收态     DP_非吸收态     差异
+     1         0.50%         0.50%       0.00%
+     3         1.45%         1.42%      -0.03%
+     6         2.80%         2.71%      -0.09%
+    12         5.20%         4.95%      -0.25%
+    18         7.40%         6.90%      -0.50%
+
+    （示意数值 — 实际数字取决于组合数据）
+```
+
+差异不大，因为只有少量概率质量到达 M3+ 后发生治愈回流。负增量通过 `max(0, DP_t - DP_{t-1})` 归零。
+
+### 3.4 方法论依据
+
+非吸收态是经审慎考虑的方法论选择，有以下依据支撑：
+
+**准则依据：**
+
+| # | 来源 | 关键内容 |
+|---|------|---------|
+| 1 | **IFRS 9 B5.5.12** ([IASB, 2014](https://www.ifrs.org/content/dam/ifrs/publications/html-standards/english/2026/issued/ifrs9.html)) | "主体可以在评估信用风险是否显著增加或计量预期信用损失时采用各种方法。" |
+
+**学术依据：**
+
+| # | 来源 | 关键内容 |
+|---|------|---------|
+| 2 | **[Botha et al. (2026)](https://link.springer.com/article/10.1007/s41060-026-01032-w)** | "违约并非借款人永久陷入的吸收状态...贷款可能从违约中治愈，再次面临违约风险"（引用 Basel S36.74 和 CRR Article 178(5)） |
+| 3 | **[Letizia (2025)](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=5047237)** | 讨论非吸收态"可能导致预期损失的低估" |
+
+**对该文献观点的考量：** Letizia 提出的关切在本框架中已通过以下设计予以缓解：(i) M3+ 暴露在 ECL 公式中直接使用 PD = 100%（最保守处理），(ii) 非吸收效应仅影响 Stage 1/2 的违约概率曲面，且反映的是实际观测到的治愈行为。
+
+### 3.5 针对审计师补充引用 (Basel CRE32.3) 的回应
+
+审计师引用了 [Basel CRE32.3](https://www.bis.org/basel_framework/chapter/CRE/32.htm)：
+
+> "For corporate, sovereign and bank exposures, the PD is the one-year PD associated with the internal borrower grade to which that exposure is assigned. The PD of borrowers assigned to a default grade(s), consistent with the reference definition of default, is 100%."
+
+该引用与本方案不存在冲突，理由如下：
+
+**(1) 适用范围：** CRE32.3 明确限定于 **"corporate, sovereign and bank exposures"**（批发类暴露），不适用于零售消费信贷。零售暴露的 PD 要求在 CRE32.58 中单独规定。
+
+**(2) 内容辨析：** 该条款说的是**给违约等级的借款人赋值 PD = 100%**，是关于**评级等级的 PD 赋值**，**不涉及转移矩阵的建模结构**（吸收态 vs. 非吸收态）。本模型已在 ECL 公式中对 M3+ 直接赋值 PD = 100%，完全符合该原则。
+
+**(3) 框架区分：** Basel CRE32 属于 **监管资本框架**（IRB 方法），用于 RWA 和最低资本充足率计算。本 ECL 计算在 **IFRS 9 会计准则**下进行。[Kruger et al. (2022)](https://www.garp.org/hubfs/Whitepapers/a2r5d000003s7K0AAI_RiskIntel.WP.IFRS9.PD.Jan22.pdf) 明确指出："IFRS 9 is a principle-based standard, and does not prescribe specific models to be used."
+
+**(4) 行业实践认知：** 在零售 roll rate 模型中，将违约作为吸收态是**常见行业惯例**（common practice），但**并非准则硬性要求**。本非吸收态方案偏离惯例，但因以下原因仍属合理方法论选择：
+- IFRS 9 赋予方法论灵活性（B5.5.12）
+- M3+ 暴露直接使用 PD = 100%，消除了低估风险
+- 组合中存在实质性治愈行为，非吸收态反映了该客观事实
+
+如审计师倾向于采用吸收态，欢迎提供支持该选择的具体方法论或准则依据，以便双方在模型治理框架下共同评估权衡。
+
+---
+
+## 4. ECL 重算差异 — 18 个月 Marginal PD Capping 的影响
+
+### 4.1 澄清 "18 个月 cap"
+
+"18 个月 cap" **不是**对单个 MPD 值的截断，而是 **ECL 求和范围的上限** — 多期 ECL 公式逐月求和的最大期数。
+
+**ECL 公式——分步说明：**
+
+```
+算法：单账户的多期折现 ECL
+
+输入：
+  bucket     = 当前逾期 bucket（如 M2）
+  EAD[0..36] = 每月剩余本金计划
+  MPD[1..18] = 边际 PD surface（PiT 调整后，情景 s）
+  LGD        = 违约损失率（如 ID BNPL 为 0.9288）
+  EIR        = 每期有效利率（默认 5%）
+
+步骤 1：确定求和范围
+  T_rem = EAD > 0 的最后月份  （从摊销计划推断）
+  T_max = 阶段依赖的最大范围  （见下表）
+  T_h   = min(T_rem, T_max)   <-- 这就是 "cap"
+
+步骤 2：累加折现预期损失
+  ECL = 0
+  FOR t = 1 TO T_h：
+      loss_t = EAD[t-1] x MPD[t] x LGD    （未折现损失）
+      ECL   += loss_t / (1 + EIR)^t         （现值）
+
+  RETURN ECL
+```
+
+**阶段依赖最大范围：**
+
+| 阶段 | Bucket | T_max | IFRS 9 依据 |
+|------|--------|-------|------------|
+| Stage 1 | M0, M1 | 12 个月 | 12个月 ECL (IFRS 9 S5.5.5) |
+| Stage 2 | M2, M3 | 18 个月 | Lifetime ECL，上限18 |
+| Stage 3 | M3+ | 单期 | 直接公式：PD=100% |
+
+### 4.2 各产品影响 — 实证验证
+
+对全部三个产品的所有账户进行了期限扫描（基于 EAD 摊销计划中最后一个非零值推断剩余期限），结果如下：
+
+| 产品 | 最大实际期限 | Stage 2 中 tenor > 18 的账户占比 | 改为 24/36 的 ECL 变化 |
+|------|------------|-------------------------------|---------------------|
+| **PH BNPL** | 13 个月 | **0%** | **0.00** |
+| **ID BNPL** | 13 个月 | **0%** | **0.00** |
+| **ID Cash** | 12 个月 | **0%** | **0.00** |
+
+**结论：** 18 个月 Stage 2 cap 对全部组合中的**所有账户均不构成约束**。三个产品的最大实际剩余期限均不超过 **13 个月**，远低于 18 个月阈值。将 T_max 从 18 扩展到 24 或 36 个月后重新运行 ECL 引擎，产出 **完全一致**（差异 = 0.00）。
+
+---
+
+## 5. 情景叙述
+
+已在 ECL 方法论文档 S6.2.1 记录印尼和菲律宾两个市场的情景叙述。摘要：
+
+- **Base 情景**锚定 **[IMF WEO (2026年4月)](https://www.imf.org/en/Publications/WEO)** GDP 预测 — 印尼 5.0%、菲律宾 4.1%
+- **Upside/Downside** 基于**历史 GDP 增长分位数**（P10/P90 或 P5/P95，取决于偏度）
+- 每个叙述附带定性经济背景说明，用于满足 IFRS 9 对"合理且可支持"的前瞻性信息要求；**实际计算仅使用 GDP 数值，叙述本身不参与计算**
+
+---
+
+## 6. 情景概率权重 (PW) 定量计算方法
+
+概率权重按市场分别推导，核心方法为 **矩匹配（moment matching）**：求解一组权重 *(w_b, w_u, w_d)*，使三个情景的 GDP 值在概率加权后重现历史 QoQ GDP 增长率分布的前两阶矩（均值和方差）。
+
+### 6.1 输入数据
+
+- **历史 QoQ GDP 增长率** 序列：印尼 48 个季度，菲律宾 64 个季度
+- 由此计算历史均值 **μ** 和标准差 **σ**
+- **三个情景 GDP 值**（QoQ）：*g_b*（Base）、*g_u*（Upside）、*g_d*（Downside），分别来自 IMF WEO 预测和历史分位数
+
+### 6.2 解析矩匹配（主方法）
+
+求解 3×3 线性方程组 **A · w = b**：
+
+```
+| 1          1          1        |   | w_b |   | 1   |
+| g_b        g_u        g_d      | × | w_u | = | μ   |
+| (g_b-μ)²   (g_u-μ)²   (g_d-μ)² |   | w_d |   | σ²  |
+```
+
+三个方程的含义：
+
+1. **w_b + w_u + w_d = 1** — 权重归一
+2. **w_b·g_b + w_u·g_u + w_d·g_d = μ** — 加权均值 = 历史均值
+3. **w_b·(g_b−μ)² + w_u·(g_u−μ)² + w_d·(g_d−μ)² = σ²** — 加权方差 = 历史方差
+
+通过 `numpy.linalg.solve` 求解。若系数矩阵行列式接近零或任一权重 < 1%，则转入回退方法。
+
+### 6.3 约束优化回退
+
+当解析解不可行时，转为数值优化：
+
+```
+最小化目标：
+  f(w) = (Σ w_i·g_i − μ)² + (Σ w_i·(g_i−μ)² − σ²)²
+
+约束：
+  Σ w_i = 1
+  0.001 ≤ w_i ≤ 0.998  (i = b, u, d)
+```
+
+使用 SLSQP 算法求解，多个初始点取最优。若仍无可行解（任一权重 < 1%），则转入历史频率方法。
+
+### 6.4 历史频率回退
+
+统计历史 QoQ GDP 增长率落入三个区间的频率：
+
+```
+w_d = count(GDP < g_d) / N
+w_u = count(GDP > g_u) / N
+w_b = 1 − w_d − w_u
+```
+
+### 6.5 当期计算结果
+
+三个产品当前均使用 **解析矩匹配** 成功求解的权重：
+
+| 市场 | Base | Upside | Downside | 来源 |
+|------|------|--------|----------|------|
+| **印尼** | 36.4% | 30.7% | 32.8% | 解析矩匹配 |
+| **菲律宾** | 13.4% | 67.6% | 19.0% | 解析矩匹配 |
+
+菲律宾 Upside 权重较高，因其 QoQ GDP 分布存在左偏（即 Base 情景 GDP 值位于分布均值以上，矩匹配需要更多权重分配给 Upside 以拉低加权均值至历史均值）。
+
+### 6.6 权重与组合风险特征的对齐
+
+权重推导通过以下设计与组合风险特征保持一致：
+
+1. **按市场分别推导：** 印尼和菲律宾分别推导权重，反映两个市场不同的宏观经济环境。同一市场内的不同产品（ID BNPL、ID Cash）使用相同权重，因为它们处于相同的国家级经济条件下。
+
+2. **GDP 作为经验证的风险驱动因子：** FLA 回归（方法论 S6.1）通过统计检验确认 GDP 增长率对组合违约率具有显著解释力。使用 GDP 数据推导权重，确保权重锚定于与本组合信用风险最相关的宏观经济变量。
+
+3. **数据一致性：** 权重推导使用的季度 GDP 数据与 FLA 回归使用的 GDP 数据频率和来源完全一致，保证方法论内部的一致性。
+
+4. **敏感性分析：** ECL 产出对合理替代权重方案不具有重大敏感性（详见方法论 S6.4.5），为本组合风险特征下矩匹配方法的稳健性提供了保障。
+
+完整推导过程见 ECL 方法论文档 S6.4。
+
+---
+
+## 参考文献
+
+Bank for International Settlements. (2020). *CRE32 — IRB approach: risk components*. Basel Framework. https://www.bis.org/basel_framework/chapter/CRE/32.htm
+
+Botha, A. P., Muller, G. E., Oberholzer, M., Verster, T., & Scheepers, D. (2026). Approaches for modelling the term-structure of default risk under IFRS 9: A tutorial using discrete-time survival analysis. *International Journal of Data Science and Analytics*, *22*, Article 67. https://link.springer.com/article/10.1007/s41060-026-01032-w
+
+European Banking Authority. (2017). *Guidelines on credit institutions' credit risk management practices and accounting for expected credit losses* (EBA/GL/2017/06). https://www.eba.europa.eu/documents/10180/1842525/d769d006-d992-4202-8838-711a034e80a2/Final%20Guidelines%20on%20Accounting%20for%20Expected%20Credit%20Losses%20(EBA-GL-2017-06).pdf
+
+International Accounting Standards Board. (2014). *IFRS 9 Financial Instruments*. IFRS Foundation. https://www.ifrs.org/content/dam/ifrs/publications/html-standards/english/2026/issued/ifrs9.html
+
+Kruger, S., Rosch, D., & Scheule, H. (2022). A literature review on the PD estimation under IFRS 9. *Global Association of Risk Professionals (GARP) Research Paper*. https://www.garp.org/hubfs/Whitepapers/a2r5d000003s7K0AAI_RiskIntel.WP.IFRS9.PD.Jan22.pdf
+
+International Monetary Fund. (2026, April). *World Economic Outlook: Navigating global divergences*. IMF. https://www.imf.org/en/Publications/WEO
+
+Letizia, A. (2025). Appropriateness of non-absorbing default for expected credit loss calculation under IFRS 9. *SSRN Electronic Journal*. https://papers.ssrn.com/sol3/papers.cfm?abstract_id=5047237
+
+---
+
+*End of document.*
